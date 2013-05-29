@@ -1,0 +1,341 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>VERY Basic TweetMap</title>
+    <style>
+      html, body, #map {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+      }
+    </style>
+
+    <script src="http://maps.googleapis.com/maps/api/js?sensor=false"></script>
+    <script src="/javascript/CanvasLayer.js"></script>
+    <script src="/javascript/framework.js"></script>
+    <script src="/javascript/gl-matrix.js"></script>
+    <script src="/javascript/jquery.min.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
+
+    <script>
+      var map;
+      var canvasLayer;
+      var gl;
+      var io;
+
+      var tweets = [null];
+      var coordinates = [];
+      var indices = [];
+      var mapCenter = new google.maps.LatLng(41.9, 12.5);
+      var isMapFullyVisible = false;
+
+      var pickingFrambuffer;
+      var pointProgram;
+      var pixelsToWebGLMatrix = new Float32Array(16);
+      var mapMatrix = new Float32Array(16);
+
+      function initialize() {
+        initializeMap();
+        initializeSocket();
+        initializeWebGL();
+        initializeEventHandlers();
+      }
+
+      function initializeMap(){
+        var mapDiv = document.getElementById('map');
+
+        map = new google.maps.Map(mapDiv, {
+          zoom: 3,
+          minZoom: 3,
+          center: mapCenter,
+          mapTypeId: google.maps.MapTypeId.ROADMAP,
+          styles: [
+            {
+              featureType: 'poi',
+              stylers: [{visibility: 'off'}]
+            }
+          ]
+        });
+
+        canvasLayer = new CanvasLayer({
+          map: map,
+          resizeHandler: resize,
+          animate: false,
+          updateHandler: render
+        });
+      }
+
+      function initializeSocket(){
+        io = io.connect();
+
+        io.on('tweets', function(tweet){
+          var mapProjection = map.getProjection();
+          var coord = new google.maps.LatLng(tweet.coordinates[0], tweet.coordinates[1]);
+          var worldCoord = mapProjection.fromLatLngToPoint(coord);
+
+          var index = tweets.length;
+          var r = ((index >> 16) & 0xFF) / 255.0;
+          var g = ((index >> 8) & 0xFF) / 255.0;
+          var b = (index & 0xFF) / 255.0;
+
+          coordinates.push(worldCoord.x);
+          coordinates.push(worldCoord.y);
+
+          indices.push(r);
+          indices.push(g);
+          indices.push(b);
+
+          tweets.push({text: tweet.text, worldCoord: worldCoord});
+          showTweet(index);
+
+          updateGL();
+          render();
+        });
+      }
+
+      function initializeWebGL(){
+        gl = Framework.initializeWebGL(canvasLayer.canvas);
+        initializeShaderProgram();
+        initializePicking();
+      }
+
+      function initializeShaderProgram() {
+        var shaderList = [];
+
+        shaderList.push(Framework.loadShader(gl, 'pointVertexShader'));
+        shaderList.push(Framework.loadShader(gl, 'pointFragmentShader'));
+        pointProgram = Framework.createProgram(shaderList);
+        gl.useProgram(pointProgram);
+      }
+
+      function initializePicking(){
+        var width = canvasLayer.canvas.width;
+        var height = canvasLayer.canvas.height;
+
+        var texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+        pickingFramebuffer = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, pickingFramebuffer);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      }
+
+      function initializeEventHandlers(){
+        window.onclick = function(e){
+          gl.bindFramebuffer(gl.FRAMEBUFFER, pickingFramebuffer);
+
+          var pixel = new Uint8Array(4);
+          gl.readPixels(e.x, canvasLayer.canvas.height - e.y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+          var index = (pixel[0] << 16) + (pixel[1] << 8) + pixel[2];
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+          if(index)
+            showTweet(index);
+        }
+
+        google.maps.event.addListener(map, 'center_changed', function(){
+          checkBounds();
+        });
+
+        google.maps.event.addListener(map, 'zoom_changed', function(){
+          checkBounds();
+        });
+      }
+
+      function checkBounds(){
+        var bounds = map.getBounds();
+        var center = map.getCenter();
+
+        var ne = bounds.getNorthEast();
+        var sw = bounds.getSouthWest();
+        var lngOff = 0;
+
+        if(center.equals(mapCenter)){
+          return;
+        }
+
+        if(sw.lng() == -180 && ne.lng() == 180){
+          map.setCenter(mapCenter);
+          this.isMapFullyVisible = true;
+          return;
+        }
+
+        if(sw.lng() >= ne.lng()){
+          var left = 180 - Math.abs(sw.lng());
+          var right = 180 - Math.abs(ne.lng());
+
+          if(left < right)
+            lngOff = left + 3;
+          else
+            lngOff = -right + 3;
+        }
+
+        lngOff && map.setCenter(new google.maps.LatLng(center.lat(), center.lng() + lngOff));
+        this.isMapFullyVisible = false;
+      }
+
+      function render() {
+        var loc = gl.getUniformLocation(pointProgram, 'offscreen');
+        gl.bindFramebuffer(gl.FRAMEBUFFER, pickingFramebuffer);
+        gl.uniform1i(loc, true);
+        renderGL();
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.uniform1i(loc, false);
+        renderHTML();
+        renderGL();
+      }
+
+      function showTweet(index){
+        var tweet = tweets[index];
+        var localCoord = worldToLocal(tweet.worldCoord);
+
+        var box = $("<div class='tweet'>" + tweet.text + "</div>").css({
+          "top": localCoord[1],
+          "left": localCoord[0],
+          "position": "absolute",
+          "background": "white",
+          "border-radius": "10px",
+          "padding-left": "3px",
+          "padding-right": "3px",
+          "padding-top": "1px",
+          "padding-bottom": "1px",
+          "font-size": "10px",
+          "font-family": "Helvetica"
+        }).data("tweet", index);
+        $("body").append(box);
+        box.fadeOut(4000, function(){
+          $(this).remove();
+        });
+      }
+
+      function updateGL() {
+        if(coordinates.length == 0)
+          return;
+
+        var pointArrayBuffer = gl.createBuffer();
+        var rawData = new Float32Array(coordinates);
+        gl.bindBuffer(gl.ARRAY_BUFFER, pointArrayBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, rawData, gl.STATIC_DRAW);
+
+        var attributeLoc = gl.getAttribLocation(pointProgram, 'worldCoord');
+        gl.enableVertexAttribArray(attributeLoc);
+        gl.vertexAttribPointer(attributeLoc, 2, gl.FLOAT, false, 0, 0);
+
+        var colorBuffer = gl.createBuffer(); 
+        var indexData = new Float32Array(indices);
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, indexData, gl.STATIC_DRAW);
+
+        attributeLoc = gl.getAttribLocation(pointProgram, 'index');
+        gl.enableVertexAttribArray(attributeLoc);
+        gl.vertexAttribPointer(attributeLoc, 3, gl.FLOAT, false, 0, 0);
+      }
+
+      function resize() {
+        var width = canvasLayer.canvas.width;
+        var height = canvasLayer.canvas.height;
+
+        gl.viewport(0, 0, width, height);
+        pixelsToWebGLMatrix.set([2/width, 0, 0, 0, 
+                                 0, -2/height, 0, 0,
+                                 0, 0, 0, 0, 
+                                 -1, 1, 0, 1]);
+
+        initializePicking();
+      }
+
+      function worldToLocal(point){
+        var v = [point.x, point.y, 0.0, 1.0];
+        var m = mat4.create();
+        var mapProjection = map.getProjection();
+
+        var scale = Math.pow(2, map.zoom);
+        var offset = mapProjection.fromLatLngToPoint(canvasLayer.getTopLeft());
+        mat4.scale(m, m, [scale, scale, 0]);
+        mat4.translate(m, m, [-offset.x, -offset.y, 0]);
+        vec3.transformMat4(v, v, m);
+
+        v[0] -= 7;
+        v[1] -= 24;
+        return v;
+      }
+
+      function renderHTML(){
+        $('.tweet').each(function (){
+          var worldCoord = tweets[$(this).data("tweet")].worldCoord;
+          var localCoord = worldToLocal(worldCoord);
+
+          $(this).css({
+            "top": localCoord[1],
+            "left": localCoord[0]
+          })
+        });
+      }
+
+      function renderGL(){
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        var mapProjection = map.getProjection();
+        mapMatrix.set(pixelsToWebGLMatrix);
+
+        var scale = Math.pow(2, map.zoom);
+        mat4.scale(mapMatrix, mapMatrix, [scale, scale, 0]);
+
+        var offset = mapProjection.fromLatLngToPoint(canvasLayer.getTopLeft());
+        mat4.translate(mapMatrix, mapMatrix, [-offset.x, -offset.y, 0]);
+
+        var matrixLoc = gl.getUniformLocation(pointProgram, 'mapMatrix');
+        gl.uniformMatrix4fv(matrixLoc, false, mapMatrix);
+
+        gl.drawArrays(gl.POINTS, 0, tweets.length - 1);
+      }
+
+      document.addEventListener('DOMContentLoaded', initialize, false);
+    </script>
+
+    <script id="pointVertexShader" type="x-shader/x-vertex">
+      attribute vec4 worldCoord;
+      attribute vec4 index;
+
+      uniform mat4 mapMatrix;
+
+      varying vec4 color;
+
+      void main() {
+        gl_Position = mapMatrix * worldCoord;
+        gl_PointSize = 18.;
+        color = index;
+      }
+    </script>
+    <script id="pointFragmentShader" type="x-shader/x-fragment">
+      precision mediump float;
+
+      varying vec4 color;
+      uniform bool offscreen;
+
+      void main() {
+        float dist = length(gl_PointCoord - vec2(0.5));
+
+        if(dist > 0.5)
+          discard;
+
+        if(offscreen)
+          gl_FragColor = color;
+        else
+          gl_FragColor = vec4(1.0 - dist, 0., 0., 1.);
+      }
+    </script>
+  </head>
+
+  <body>
+    <div id="map"></div>
+  </body>
+</html>
